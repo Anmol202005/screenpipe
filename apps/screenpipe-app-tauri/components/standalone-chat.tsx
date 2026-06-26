@@ -41,6 +41,7 @@ import { ImageViewerDialog } from "@/components/chat/standalone/image-viewer-dia
 import { StandaloneChatHeader } from "@/components/chat/standalone/standalone-chat-header";
 import { ChatMainPane } from "@/components/chat/standalone/chat-main-pane";
 import { ChatComposer } from "@/components/chat/standalone/chat-composer";
+import { PipeQuickActions } from "@/components/pipe-quick-actions";
 import { useChatScroll } from "@/components/chat/standalone/hooks/use-chat-scroll";
 import { useChatConnections } from "@/components/chat/standalone/hooks/use-chat-connections";
 import { useChatAttachments } from "@/components/chat/standalone/hooks/use-chat-attachments";
@@ -104,8 +105,17 @@ export function StandaloneChat({
   className,
   hideInlineHistory,
   sidebarCollapsed,
+  pipeFocused,
+  pipeName,
 }: {
   className?: string;
+  /** When true, strip the general chat chrome (suggestion/template empty-state
+   *  cards, connect banner, inline suggestions) so the pane reads as a focused
+   *  conversation about a single pipe. Set by the pipe editor's two-pane view. */
+  pipeFocused?: boolean;
+  /** When set, render pipe quick-action chips above the composer, wired to
+   *  this chat's own sendMessage (so prompts land in the current conversation). */
+  pipeName?: string;
   /** When true, the in-panel History button + slide-in panel are hidden.
    *  Set this from the home page where the chat list lives in the main
    *  app sidebar (avoids two history UIs side-by-side). The overlay
@@ -1099,6 +1109,7 @@ export function StandaloneChat({
       <div className="flex-1 flex flex-col min-w-0">
       <ChatMainPane
         hideInlineHistory={hideInlineHistory}
+        pipeFocused={pipeFocused}
         showHistory={showHistory}
         onCloseHistory={() => setShowHistory(false)}
         historySearch={historySearch}
@@ -1145,6 +1156,8 @@ export function StandaloneChat({
         scrollToBottom={scrollToBottom}
       />
 
+      {pipeName && <PipeQuickActions pipeName={pipeName} onSend={sendMessage} />}
+
       <ChatComposer
         prefill={{
           context: prefillContext,
@@ -1157,7 +1170,7 @@ export function StandaloneChat({
           onClearFrame: () => setPrefillFrameId(null),
         }}
         suggestions={{
-          show: messages.length > 0 && !isLoading && settings?.showChatSuggestions !== false,
+          show: messages.length > 0 && !isLoading && settings?.showChatSuggestions !== false && !pipeFocused,
           suggestions: connectionAwareSuggestions,
           inputSectionWidth,
           isRefreshing: suggestionsRefreshing,
@@ -1262,7 +1275,7 @@ export function StandaloneChat({
           onSelectPreset: setActivePreset,
         }}
         connectBanner={{
-          show: showConnectBanner,
+          show: showConnectBanner && !pipeFocused,
           suggestedConnectionTiles,
           onOpenConnectionSetup: openConnectionSetup,
           onDismiss: () => {

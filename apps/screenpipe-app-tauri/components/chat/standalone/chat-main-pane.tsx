@@ -24,6 +24,9 @@ type ActivePipeExecution = {
 
 interface ChatMainPaneProps {
   hideInlineHistory?: boolean;
+  /** Pipe editor mode: hide the general suggestion/template empty-state cards
+   *  in favour of a minimal, pipe-focused hint. */
+  pipeFocused?: boolean;
   showHistory: boolean;
   onCloseHistory: () => void;
   historySearch: string;
@@ -56,6 +59,7 @@ interface ChatMainPaneProps {
 
 export function ChatMainPane({
   hideInlineHistory,
+  pipeFocused,
   showHistory,
   onCloseHistory,
   historySearch,
@@ -166,7 +170,15 @@ export function ChatMainPane({
             !isLoading &&
             !isStreaming &&
             hasPresets &&
-            hasValidModel && <SummaryCards {...summaryCardsProps} />}
+            hasValidModel &&
+            (pipeFocused ? (
+              <div className="flex flex-col items-center justify-center text-center py-16 px-6 text-muted-foreground">
+                <p className="text-sm">ask about this pipe, run it, or edit it</p>
+                <p className="text-xs mt-1 opacity-70">e.g. “run it now”, “why did the last run fail?”, “tighten the instructions”</p>
+              </div>
+            ) : (
+              <SummaryCards {...summaryCardsProps} />
+            ))}
           <ChatMessageList {...messageListProps} />
 
           <div ref={messagesEndRef} />
