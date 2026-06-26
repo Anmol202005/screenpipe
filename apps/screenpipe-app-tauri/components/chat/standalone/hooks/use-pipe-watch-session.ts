@@ -75,7 +75,7 @@ export function usePipeWatchSession({
       }
     };
 
-    const initWatch = async (pipeName: string, executionId: number, presetId?: string | null) => {
+    const initWatch = async (pipeName: string, executionId: number, presetId?: string | null, hidden?: boolean) => {
       startPipeExecution(pipeName, executionId);
 
       if (presetId && aiPresets) {
@@ -101,6 +101,7 @@ export function usePipeWatchSession({
           pipeContext: { pipeName, executionId, startedAt },
           isLoading: true,
           isStreaming: true,
+          ...(hidden ? { hidden: true } : {}),
         });
       }
 
@@ -112,6 +113,7 @@ export function usePipeWatchSession({
         updatedAt: Date.now(),
         kind: "pipe-watch",
         pipeContext: { pipeName, executionId, startedAt },
+        ...(hidden ? { hidden: true } : {}),
       };
       await loadConversationRef.current(pipeConversation);
 
@@ -149,9 +151,9 @@ export function usePipeWatchSession({
     }
 
     let unlisten: (() => void) | null = null;
-    listen<{ pipeName: string; executionId: number; presetId?: string | null }>("watch_pipe", (event) => {
-      const { pipeName, executionId, presetId } = event.payload;
-      void initWatch(pipeName, executionId, presetId);
+    listen<{ pipeName: string; executionId: number; presetId?: string | null; hidden?: boolean }>("watch_pipe", (event) => {
+      const { pipeName, executionId, presetId, hidden } = event.payload;
+      void initWatch(pipeName, executionId, presetId, hidden);
     }).then((fn) => {
       unlisten = fn;
     });
