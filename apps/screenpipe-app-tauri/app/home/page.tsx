@@ -41,6 +41,7 @@ import { BrainSection } from "@/components/settings/brain-section";
 import { ConnectionsSection } from "@/components/settings/connections-section";
 import { MeetingNotesSection } from "@/components/meeting-notes";
 import { StandaloneChat } from "@/components/standalone-chat";
+import { PipeChatHeader } from "@/components/pipe-chat-header";
 import { ChatSidebar } from "@/components/chat-sidebar";
 import { ChatHistoryView } from "@/components/chat/chat-history-view";
 import { mountPiEventRouter } from "@/lib/stores/pi-event-router";
@@ -117,6 +118,46 @@ function HomeContent() {
     serialize: (value) => value,
   });
   const [connectionFocusRequest, setConnectionFocusRequest] = useState<ConnectionFocusRequest | null>(null);
+  // Notion-style pipe editor: when set, the Pipes view becomes a two-pane
+  // editor — the always-mounted chat on the left, this pipe's settings on the
+  // right. Kept here (not inside PipesSection) so the single chat is reused.
+  const [openPipeName, setOpenPipeName] = useState<string | null>(null);
+  // Whether the pipe settings sidebar is shown. Collapsible so the pipe chat
+  // can take the full width while staying in the pipe's context.
+  const [pipeSettingsOpen, setPipeSettingsOpen] = useState(true);
+  // Latest openPipeName for event listeners (which capture stale state).
+  const openPipeNameRef = useRef<string | null>(null);
+  useEffect(() => {
+    openPipeNameRef.current = openPipeName;
+  }, [openPipeName]);
+  const openPipeEditor = useCallback((name: string) => {
+    openPipeNameRef.current = name;
+    setOpenPipeName(name);
+    setPipeSettingsOpen(true);
+    // Start a fresh, hidden conversation each time a pipe is opened: the pipe
+    // chat is ephemeral and shouldn't pile up in the sidebar recents. `hidden`
+    // routes it out of recents (chat-sidebar), `draft` keeps it out until used.
+    const id = crypto.randomUUID();
+    const store = useChatStore.getState();
+    Object.values(store.sessions).forEach((s) => {
+      if (s.draft) store.actions.drop(s.id);
+    });
+    store.actions.upsert({
+      id,
+      title: "untitled",
+      preview: "",
+      status: "idle",
+      messageCount: 0,
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      pinned: false,
+      unread: false,
+      draft: true,
+      hidden: true,
+    });
+    store.actions.setCurrent(id);
+    void emit("chat-load-conversation", { conversationId: id });
+  }, []);
 
   const { settings } = useSettings();
   const { isTranslucent } = useSidebarContext();
@@ -176,6 +217,11 @@ function HomeContent() {
       setActiveSection("home");
     }
   }, [settings.disableTimeline, activeSection, setActiveSection]);
+
+  // Close the pipe editor when navigating away from the Pipes section.
+  useEffect(() => {
+    if (activeSection !== "pipes" && openPipeName) setOpenPipeName(null);
+  }, [activeSection, openPipeName]);
 
   // Mount the Pi event router once, app-wide. Listens for `pi_event` /
   // `pi_session_evicted` outside any chat-component lifecycle and mirrors
@@ -356,6 +402,9 @@ function HomeContent() {
       const { listen } = await import("@tauri-apps/api/event");
       const u = await listen<ChatLoadConversationPayload>("chat-load-conversation", (event) => {
         if (cancelled) return;
+        // In the pipe editor the chat is already the left pane — don't yank the
+        // user to the chat section (which would close the editor).
+        if (openPipeNameRef.current) return;
         if (!shouldActivateHomeSectionForChatLoadConversation(event.payload)) return;
         setActiveSection("home");
       });
@@ -760,10 +809,13 @@ function HomeContent() {
     return () => { unlisten?.(); };
   }, []);
 
-  // Watch pipe: navigate to chat when user clicks "watch" on a running pipe
+  // Watch pipe: navigate to chat when user clicks "watch" on a running pipe.
+  // Exception: when the pipe editor is open, the run already streams into the
+  // editor's left-pane chat, so stay put instead of switching to the chat tab.
   useEffect(() => {
     let unlisten: (() => void) | null = null;
     listen<{ pipeName: string; executionId: number }>("watch_pipe", () => {
+      if (openPipeNameRef.current) return;
       setActiveSection("home");
     }).then((fn) => { unlisten = fn; });
     return () => { unlisten?.(); };
@@ -829,7 +881,7 @@ function HomeContent() {
       case "brain":
         return <BrainSection />;
       case "pipes":
-        return <PipeStoreView />;
+        return <PipeStoreView onOpenPipe={openPipeEditor} />;
       case "connections":
         return (
           <ConnectionsSection
@@ -1214,15 +1266,50 @@ function HomeContent() {
                 only visible when the user navigates back to the chat. */}
             <div
               className={cn(
-                "flex-1 min-h-0 overflow-hidden",
-                activeSection !== "home" && "hidden"
+                "flex-1 min-h-0 flex overflow-hidden",
+                // Hidden only when on a non-chat section AND no pipe editor is
+                // open. When a pipe editor is open, this row stays visible so
+                // the chat can serve as the editor's left pane.
+                activeSection !== "home" && !openPipeName && "hidden"
               )}
             >
-              <StandaloneChat className="h-full" hideInlineHistory sidebarCollapsed={sidebarCollapsed} />
+              {/* Chat — stable position so it never unmounts. Becomes the left
+                  pane (flex-1) when a pipe editor opens beside it. The pipe
+                  header is a conditional slot ABOVE the chat; the chat is kept
+                  at a fixed wrapper so toggling the header never remounts it. */}
+              <div className={cn("flex flex-col min-h-0 overflow-hidden flex-1 min-w-0", openPipeName && pipeSettingsOpen && "border-r border-border")}>
+                {openPipeName ? (
+                  <PipeChatHeader
+                    pipeName={openPipeName}
+                    settingsOpen={pipeSettingsOpen}
+                    onToggleSettings={() => setPipeSettingsOpen((o) => !o)}
+                    onExit={() => setOpenPipeName(null)}
+                  />
+                ) : null}
+                <div className="flex-1 min-h-0 overflow-hidden">
+                  <StandaloneChat
+                    className="h-full"
+                    hideInlineHistory
+                    sidebarCollapsed={sidebarCollapsed}
+                    pipeFocused={!!openPipeName}
+                    pipeName={openPipeName ?? undefined}
+                  />
+                </div>
+              </div>
+              {/* Pipe settings right pane — collapsible Notion-style sidebar. */}
+              {openPipeName && pipeSettingsOpen && (
+                <div className="w-[460px] shrink-0 min-h-0 overflow-hidden">
+                  <PipeStoreView
+                    editorPipeName={openPipeName}
+                    onCloseEditor={() => setPipeSettingsOpen(false)}
+                    onExit={() => setOpenPipeName(null)}
+                  />
+                </div>
+              )}
             </div>
 
-            {/* Non-chat sections render on top when active. */}
-            {activeSection !== "home" && (
+            {/* Non-chat sections render on top when active and no pipe editor. */}
+            {activeSection !== "home" && !openPipeName && (
               isFullHeight ? (
                 <div className="flex-1 min-h-0 overflow-hidden">
                   {renderMainSection()}

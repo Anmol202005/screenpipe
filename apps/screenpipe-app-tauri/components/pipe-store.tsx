@@ -307,7 +307,22 @@ function normalizePipe(raw: any): any {
   };
 }
 
-export function PipeStoreView() {
+export function PipeStoreView({
+  editorPipeName = null,
+  onOpenPipe,
+  onCloseEditor,
+  onExit,
+}: {
+  /** When set, render only the Notion-style editor for this pipe (no tab
+   *  chrome). The two-pane shell (chat + this panel) is composed by the
+   *  home page so the single always-mounted chat can be reused. */
+  editorPipeName?: string | null;
+  onOpenPipe?: (name: string) => void;
+  /** Collapse the settings panel (keep the pipe chat open). */
+  onCloseEditor?: () => void;
+  /** Exit the editor entirely, back to the pipe list. */
+  onExit?: () => void;
+} = {}) {
   // Track installed pipe count to auto-switch to Discover for new users
   const [installedCount, setInstalledCount] = useState<number | null>(null);
 
@@ -352,6 +367,19 @@ export function PipeStoreView() {
     }
   }, [installedCount]);
 
+  // Editor mode: render only the Notion-style settings panel for one pipe.
+  // The home page mounts this as the right pane beside the always-mounted chat.
+  if (editorPipeName) {
+    return (
+      <PipesSection
+        editorPipeName={editorPipeName}
+        onOpenPipe={onOpenPipe}
+        onCloseEditor={onCloseEditor}
+        onExit={onExit}
+      />
+    );
+  }
+
   const tabs = [
     { key: "my-pipes" as const, label: "My Pipes" },
     { key: "discover" as const, label: "Discover" },
@@ -388,7 +416,7 @@ export function PipeStoreView() {
       {activeTab === "discover" ? (
         <DiscoverView onInstalled={() => setActiveTab("my-pipes")} />
       ) : (
-        <PipesSection />
+        <PipesSection onOpenPipe={onOpenPipe} />
       )}
     </div>
   );

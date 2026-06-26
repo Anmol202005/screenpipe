@@ -34,6 +34,7 @@ import {
   AlertCircle,
   Copy,
   Star,
+  ArrowLeft,
 } from "lucide-react";
 import { usePipeFavorites } from "@/lib/hooks/use-pipe-favorites";
 import {
@@ -58,6 +59,7 @@ import {
 } from "@/components/ui/select";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { emit, once, listen, type UnlistenFn } from "@tauri-apps/api/event";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import { mountAgentEventBus, registerDefault } from "@/lib/events/bus";
 import { parsePipeSessionId } from "@/lib/events/types";
 import { ChatPrefillData } from "@/lib/chat-utils";
@@ -950,7 +952,24 @@ function pipeScheduleLabel(config: PipeConfig): string {
 }
 
 
-export function PipesSection() {
+export function PipesSection({
+  editorPipeName = null,
+  onOpenPipe,
+  onCloseEditor,
+  onExit,
+}: {
+  /** When set, render the Notion-style two-pane editor's right column for
+   *  this pipe instead of the pipe list. The chat (left pane) is the home
+   *  page's single always-mounted StandaloneChat. */
+  editorPipeName?: string | null;
+  /** Open the editor for a pipe (clicking a row). When omitted, rows fall
+   *  back to the legacy inline expand so the section still works standalone. */
+  onOpenPipe?: (name: string) => void;
+  /** Collapse the settings panel (keeps the pipe chat open). */
+  onCloseEditor?: () => void;
+  /** Exit the editor entirely, back to the pipe list. */
+  onExit?: () => void;
+} = {}) {
   // Device selector: null = local machine, string = remote address
   const [selectedDevice, setSelectedDevice] = useState<string | null>(null);
   const { devices, discoverDevices, discovering } = useDeviceMonitor();
@@ -1718,6 +1737,62 @@ export function PipesSection() {
     }
   };
 
+  // Run the pipe, then stream its execution into the always-mounted chat by
+  // emitting `watch_pipe`. The chat's usePipeWatchSession turns that into a
+  // live `pipe-watch` conversation rendering the run's NDJSON output — this is
+  // what makes the editor's left-pane chat actually run and show the pipe.
+  const runPipeAndWatch = async (name: string) => {
+    const pipe = pipes.find((p) => p.config.name === name);
+    const requiredConnections: string[] = pipe?.config?.connections ?? [];
+    if (requiredConnections.length > 0) {
+      const missing = requiredConnections.filter((id) => {
+        const baseId = pipeConnectionLookupKey(id);
+        const conn = availableConnections.find((c) => c.id === baseId);
+        return !conn || !conn.connected;
+      });
+      if (missing.length > 0) {
+        setConnectionModal({ pipeName: name, connections: requiredConnections });
+        return;
+      }
+    }
+    posthog.capture("pipe_run", { pipe: name, source: "editor" });
+    setRunningPipe(name);
+    try {
+      if (name in pendingConfigSaves.current) {
+        await pendingConfigSaves.current[name];
+      }
+      const res = await fetch(`${apiBase}/pipes/${name}/run`, { method: "POST" });
+      // Resolve the freshly-created execution id so the chat can watch it.
+      let executionId: number | null = null;
+      try {
+        const body = await res.clone().json();
+        executionId = body?.execution_id ?? body?.id ?? null;
+      } catch {}
+      if (executionId == null) {
+        for (let i = 0; i < 8 && executionId == null; i++) {
+          await new Promise((r) => setTimeout(r, 400));
+          try {
+            const r2 = await localFetch(`/pipes/${name}/executions?limit=1`);
+            const d2 = await r2.json();
+            const newest = (d2.data || d2 || [])[0];
+            if (newest?.id != null) executionId = newest.id;
+          } catch {}
+        }
+      }
+      const presetId = Array.isArray(pipe?.config?.preset)
+        ? (pipe?.config?.preset[0] as string | undefined)
+        : (pipe?.config?.preset as string | undefined);
+      if (executionId != null) {
+        // hidden: keep editor-triggered runs out of the sidebar recents.
+        await emit("watch_pipe", { pipeName: name, executionId, presetId: presetId ?? null, hidden: true });
+      }
+    } finally {
+      setRunningPipe(null);
+      fetchPipes();
+      pollRunningPipe();
+    }
+  };
+
   const stopPipe = async (name: string) => {
     posthog.capture("pipe_stopped", { pipe: name });
     setStoppingPipe(name);
@@ -1762,6 +1837,17 @@ export function PipesSection() {
       fetchExecutions(name);
     }
   };
+
+  // When opened as the Notion-style editor, target the open pipe so the
+  // live-output streaming + refresh logic (which gate on `expanded`) follow it.
+  useEffect(() => {
+    if (!editorPipeName) return;
+    setExpanded(editorPipeName);
+    expandedRef.current = editorPipeName;
+    fetchLogs(editorPipeName);
+    fetchExecutions(editorPipeName);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [editorPipeName]);
 
   const savePipeContent = useCallback(async (name: string, content: string) => {
     setSaveStatus((prev) => ({ ...prev, [name]: "saving" }));
@@ -1903,6 +1989,401 @@ export function PipesSection() {
         <Button variant="outline" size="sm" onClick={() => setSelectedDevice(null)}>
           back to this device
         </Button>
+      </div>
+    );
+  }
+
+  // Connection setup modal — shared between the pipe list and the editor (the
+  // editor returns early, so it must render this too).
+  const connectionModalEl = connectionModal && (
+    <PostInstallConnectionsModal
+      open={!!connectionModal}
+      onOpenChange={async (open) => {
+        if (!open) {
+          let latestConnections = availableConnections;
+          try {
+            latestConnections = await fetchAvailablePipeConnections(apiBase, availableConnections);
+          } catch {
+            // Fall back to current in-memory state if fetch fails.
+          }
+          const stillMissing = connectionModal.connections.some((id) => {
+            const baseId = pipeConnectionLookupKey(id);
+            const conn = latestConnections.find((c) => c.id === baseId);
+            return !conn || !conn.connected;
+          });
+          if (stillMissing) {
+            disablePipe(connectionModal.pipeName);
+          } else {
+            fetchPipes();
+          }
+          fetchConnections();
+          setConnectionModal(null);
+        }
+      }}
+      pipeName={connectionModal.pipeName}
+      connections={connectionModal.connections}
+      onConnectionRemoved={(_connectionId, updatedConnections) => {
+        const pipeName = connectionModal.pipeName;
+        setConnectionModal((prev) => (prev ? { ...prev, connections: updatedConnections } : prev));
+        setPipes((prev) =>
+          prev.map((pipe) =>
+            pipe.config.name === pipeName
+              ? { ...pipe, config: { ...pipe.config, connections: updatedConnections } }
+              : pipe
+          )
+        );
+        fetchPipes();
+        fetchConnections();
+      }}
+    />
+  );
+
+  // ─── Notion-style editor: right pane of the two-pane view ────────────────
+  // Renders the open pipe's settings (triggers / instructions / tools). The
+  // left pane is the home page's single always-mounted StandaloneChat, which
+  // runs and streams this pipe via `watch_pipe` (see runPipeAndWatch).
+  if (editorPipeName) {
+    const pipe = pipes.find((p) => p.config.name === editorPipeName);
+    const exitEditor = () => (onExit ? onExit() : onCloseEditor?.()); // back to list
+
+    if (!pipe) {
+      return (
+        <div className="flex flex-col h-full bg-background">
+          <div className="flex items-center gap-2 px-4 h-12 border-b shrink-0">
+            <Button variant="ghost" size="icon" className="h-7 w-7" title="back to pipes" onClick={exitEditor}>
+              <ArrowLeft className="h-4 w-4" />
+            </Button>
+            <span className="text-sm text-muted-foreground truncate">{editorPipeName}</span>
+          </div>
+          <div className="flex-1 flex items-center justify-center text-muted-foreground">
+            {loading ? <Loader2 className="h-5 w-5 animate-spin" /> : <span className="text-xs">pipe not found</span>}
+          </div>
+        </div>
+      );
+    }
+
+    const readOnly = isReceivedTeamPipe(pipe);
+    const isRunning = pipe.is_running || runningPipe === pipe.config.name;
+    const hasMissingConnections = (pipe.config.connections ?? []).some((id) => {
+      const baseId = pipeConnectionLookupKey(id);
+      const conn = availableConnections.find((c) => c.id === baseId);
+      return !conn || !conn.connected;
+    });
+    const description =
+      typeof pipe.config.description === "string" ? (pipe.config.description as string).trim() : "";
+
+    const askAi = () => {
+      posthog.capture("pipe_optimize_started", { source: "editor" });
+      emit("chat-prefill", {
+        context: "the user is editing this pipe in the pipe editor and wants help",
+        prompt: buildOptimizePrompt(pipe.config.name),
+        displayLabel: buildOptimizeDisplayLabel(pipe.config.name),
+        autoSend: true,
+        source: "pipe-editor",
+        // Target this same window's chat (the editor's left pane) so the
+        // prompt lands here, not in a detached chat overlay.
+        targetWindow: getCurrentWindow().label,
+      });
+    };
+
+    return (
+      <div className="flex flex-col h-full bg-background">
+        {/* Header — just the "settings" title. Exit (back to pipes) and
+            show/hide live on the chat header (PipeChatHeader) so there's a
+            single source for each, no duplicate buttons. */}
+        <div className="relative z-20 flex items-center px-4 h-12 border-b shrink-0">
+          <span className="text-sm font-semibold">settings</span>
+        </div>
+
+        {/* Scrollable settings column */}
+        <div className="flex-1 min-h-0 overflow-y-auto">
+          <div className="p-5 space-y-7">
+            {description && (
+              <p className="text-xs text-muted-foreground leading-relaxed -mt-1">{description}</p>
+            )}
+
+            {/* ── Auto-run ── */}
+            <div className="flex items-center justify-between gap-3 border px-3 py-2.5">
+              <div className="min-w-0">
+                <span className="text-xs font-medium">auto-run</span>
+                <p className="mt-0.5 text-[11px] text-muted-foreground">
+                  {hasMissingConnections && !pipe.config.enabled
+                    ? "connect the required apps below to enable"
+                    : "run automatically on the triggers below"}
+                </p>
+              </div>
+              <Switch
+                checked={pipe.config.enabled}
+                disabled={hasMissingConnections && !pipe.config.enabled}
+                onCheckedChange={(checked) => togglePipe(pipe.config.name, checked)}
+              />
+            </div>
+
+            {/* ── Triggers ── */}
+            <section>
+              <div className="mb-3">
+                <h3 className="text-sm font-semibold text-foreground">triggers</h3>
+                <p className="text-[11px] text-muted-foreground">when should this agent run?</p>
+              </div>
+              {/* Run agent — runs now and streams into the chat on the left */}
+              {isRunning ? (
+                <Button
+                  variant="outline"
+                  size="sm"
+                  className="w-full justify-center gap-2 mb-3"
+                  onClick={() => stopPipe(pipe.config.name)}
+                  disabled={stoppingPipe === pipe.config.name}
+                >
+                  {stoppingPipe === pipe.config.name ? (
+                    <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                  ) : (
+                    <Square className="h-3.5 w-3.5" />
+                  )}
+                  stop agent
+                </Button>
+              ) : (
+                <Button
+                  variant="outline"
+                  size="sm"
+                  className={cn("w-full justify-center gap-2 mb-3", hasMissingConnections && "text-destructive border-destructive/40")}
+                  onClick={() => {
+                    if (hasMissingConnections) {
+                      setConnectionModal({ pipeName: pipe.config.name, connections: pipe.config.connections ?? [] });
+                    } else {
+                      runPipeAndWatch(pipe.config.name);
+                    }
+                  }}
+                  disabled={runningPipe === pipe.config.name}
+                  title={hasMissingConnections ? "configure required connections first" : "run now and watch it in the chat"}
+                >
+                  {hasMissingConnections ? <AlertCircle className="h-3.5 w-3.5" /> : <Play className="h-3.5 w-3.5" />}
+                  run agent
+                </Button>
+              )}
+              <PipeTriggerPicker
+                pipeName={pipe.config.name}
+                trigger={pipe.config.trigger}
+                apiBase={apiBase}
+                scheduleConfig={pipe.config.schedule_config ?? null}
+                scheduleString={pipe.config.schedule || "manual"}
+                otherPipes={pipes
+                  .filter((p) => p.config.name !== pipe.config.name && p.config.enabled)
+                  .map((p) => ({ name: p.config.name }))}
+                availableConnections={availableConnections}
+                refreshConnections={async () => {
+                  const next = await fetchAvailablePipeConnections(apiBase, availableConnections);
+                  setAvailableConnections(next);
+                  return next;
+                }}
+                fetchPipes={fetchPipes}
+                applyOptimistic={(t) =>
+                  setPipes((prev) =>
+                    prev.map((p) =>
+                      p.config.name === pipe.config.name ? { ...p, config: { ...p.config, trigger: t } } : p
+                    )
+                  )
+                }
+                onSaveSchedule={(cfg) => {
+                  setPipes((prev) =>
+                    prev.map((p) =>
+                      p.config.name === pipe.config.name
+                        ? { ...p, config: { ...p.config, schedule_config: cfg, schedule: "manual" } }
+                        : p
+                    )
+                  );
+                  localFetch(`/pipes/${pipe.config.name}/config`, {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ schedule_config: cfg }),
+                  }).then(() => fetchPipes());
+                }}
+              />
+            </section>
+
+            {/* ── Instructions ── */}
+            <section>
+              <div className="mb-2 flex items-center gap-2">
+                <h3 className="text-sm font-semibold text-foreground">instructions</h3>
+                {saveStatus[pipe.config.name] === "saving" && (
+                  <span className="text-[11px] text-muted-foreground flex items-center gap-1">
+                    <Loader2 className="h-3 w-3 animate-spin" /> saving…
+                  </span>
+                )}
+                {saveStatus[pipe.config.name] === "saved" && (
+                  <span className="text-[11px] text-muted-foreground flex items-center gap-1">
+                    <Check className="h-3 w-3" /> saved
+                  </span>
+                )}
+                {saveStatus[pipe.config.name] === "error" && (
+                  <span className="text-[11px] text-destructive" title={saveErrors[pipe.config.name]}>
+                    save failed
+                  </span>
+                )}
+                {promptDrafts[pipe.config.name] !== undefined && !saveStatus[pipe.config.name] && (
+                  <span className="text-[11px] text-muted-foreground">unsaved</span>
+                )}
+                {!readOnly && (
+                  <Button variant="ghost" size="sm" className="h-6 px-2 ml-auto gap-1 text-muted-foreground hover:text-foreground" onClick={askAi} title="ask the chat to improve this pipe">
+                    <Sparkles className="h-3 w-3" /> ask ai
+                  </Button>
+                )}
+              </div>
+              <p className="text-[11px] text-muted-foreground mb-2">what should the agent do every time it runs?</p>
+              {readOnly && (
+                <p className="text-[11px] text-muted-foreground mb-1">
+                  shared by your team (read-only) — fork it to make an editable copy
+                </p>
+              )}
+              <Textarea
+                value={promptDrafts[pipe.config.name] ?? pipe.raw_content}
+                onChange={(e) => handlePipeEdit(pipe.config.name, e.target.value)}
+                readOnly={readOnly}
+                className={cn("text-xs font-mono h-72", readOnly && "opacity-70 cursor-not-allowed")}
+                autoCorrect="off"
+                autoCapitalize="off"
+                spellCheck={false}
+              />
+            </section>
+
+            {/* ── Tools & access ── */}
+            <section>
+              <div className="mb-2">
+                <h3 className="text-sm font-semibold text-foreground">tools &amp; access</h3>
+                <p className="text-[11px] text-muted-foreground">what apps the agent can use (credentials fetched at runtime)</p>
+              </div>
+              <div className="flex flex-wrap items-center gap-2">
+                {(pipe.config.connections || []).map((connId) => {
+                  const baseId = pipeConnectionLookupKey(connId);
+                  const instanceName = pipeConnectionInstanceName(connId);
+                  const conn = availableConnections.find((c) => c.id === baseId);
+                  const isConnected = conn?.connected ?? false;
+                  const label = pipeConnectionDisplayName(connId, conn, instanceName);
+                  const setupLabel = pipeConnectionSetupLabel(connId, conn);
+                  return (
+                    <div
+                      key={connId}
+                      title={isMcpConnectionKey(connId) && !conn ? connId : undefined}
+                      className={cn(
+                        "flex items-center gap-2 border px-3 py-1.5 text-xs font-mono transition-colors duration-150",
+                        isConnected ? "border-foreground/20" : "border-destructive/50"
+                      )}
+                    >
+                      <span className={cn("w-1.5 h-1.5", isConnected ? "bg-foreground" : "bg-destructive")} />
+                      {!isConnected ? (
+                        <button
+                          className="text-destructive hover:underline"
+                          onClick={() => setConnectionModal({ pipeName: pipe.config.name, connections: pipe.config.connections ?? [] })}
+                        >
+                          {label} — {setupLabel}
+                        </button>
+                      ) : (
+                        <span>{label}</span>
+                      )}
+                      <button
+                        className="text-muted-foreground hover:text-foreground transition-colors duration-150"
+                        onClick={() => {
+                          const updated = (pipe.config.connections || []).filter((c) => c !== connId);
+                          setPipes((prev) => prev.map((p) => p.config.name === pipe.config.name ? { ...p, config: { ...p.config, connections: updated } } : p));
+                          fetch(`${apiBase}/pipes/${pipe.config.name}/config`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ connections: updated }) }).then(() => fetchPipes());
+                        }}
+                      >
+                        ×
+                      </button>
+                    </div>
+                  );
+                })}
+                <PipeConnectionPicker
+                  availableConnections={availableConnections}
+                  selectedConnections={pipe.config.connections || []}
+                  onAdd={(key) => {
+                    const existing = pipe.config.connections || [];
+                    if (existing.includes(key)) return;
+                    const updated = [...existing, key];
+                    setPipes((prev) => prev.map((p) => p.config.name === pipe.config.name ? { ...p, config: { ...p.config, connections: updated } } : p));
+                    fetch(`${apiBase}/pipes/${pipe.config.name}/config`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ connections: updated }) }).then(() => fetchPipes());
+                  }}
+                  onOpenConnections={() => {
+                    window.dispatchEvent(new CustomEvent("open-settings", { detail: { section: "connections" } }));
+                  }}
+                />
+              </div>
+              <div className="mt-4">
+                <PipePresetSelector
+                  pipe={pipe}
+                  setPipes={setPipes}
+                  fetchPipes={fetchPipes}
+                  pendingConfigSaves={pendingConfigSaves}
+                  apiBase={apiBase}
+                />
+              </div>
+            </section>
+
+            {/* ── Advanced ── */}
+            <section className="space-y-3">
+              <h3 className="text-sm font-semibold text-foreground">advanced</h3>
+              <div className="flex items-center justify-between gap-3 border px-3 py-2.5">
+                <div className="min-w-0">
+                  <span className="text-xs font-medium">allow notification api</span>
+                  <p className="mt-0.5 text-[11px] text-muted-foreground">blocks POST /notify calls when off.</p>
+                </div>
+                <Switch
+                  checked={!isNotificationsDenied(promptDrafts[pipe.config.name] ?? pipe.raw_content)}
+                  onCheckedChange={(checked) => toggleNotifications(pipe.config.name, checked)}
+                />
+              </div>
+              <div>
+                <Label className="text-xs mb-2 block">timeout</Label>
+                <Select
+                  value={String(pipe.config.timeout || 600)}
+                  onValueChange={(value) => {
+                    const pipeName = pipe.config.name;
+                    const timeout = Number(value);
+                    setPipes((prev) => prev.map((p) => p.config.name === pipeName ? { ...p, config: { ...p.config, timeout } } : p));
+                    const savePromise = fetch(`${apiBase}/pipes/${pipeName}/config`, {
+                      method: "POST",
+                      headers: { "Content-Type": "application/json" },
+                      body: JSON.stringify({ timeout }),
+                    }).then(() => { delete pendingConfigSaves.current[pipeName]; fetchPipes(); }).catch(() => { delete pendingConfigSaves.current[pipeName]; });
+                    pendingConfigSaves.current[pipeName] = savePromise;
+                  }}
+                >
+                  <SelectTrigger className="h-8 text-xs">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {[
+                      { value: "120", label: "2 minutes" },
+                      { value: "300", label: "5 minutes" },
+                      { value: "600", label: "10 minutes" },
+                      { value: "900", label: "15 minutes" },
+                      { value: "1800", label: "30 minutes" },
+                      { value: "3600", label: "1 hour" },
+                    ].map((opt) => (
+                      <SelectItem key={opt.value} value={opt.value}>{opt.label}</SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </div>
+              <div className="flex items-center justify-between border px-3 py-2.5">
+                <span className="text-xs font-medium">history</span>
+                <Switch
+                  checked={!!pipe.config.history}
+                  onCheckedChange={(checked) => {
+                    const pipeName = pipe.config.name;
+                    setPipes((prev) => prev.map((p) => p.config.name === pipeName ? { ...p, config: { ...p.config, history: checked } } : p));
+                    const savePromise = fetch(`${apiBase}/pipes/${pipeName}/config`, {
+                      method: "POST",
+                      headers: { "Content-Type": "application/json" },
+                      body: JSON.stringify({ history: checked }),
+                    }).then(async () => { await new Promise((r) => setTimeout(r, 500)); delete pendingConfigSaves.current[pipeName]; fetchPipes(); }).catch(() => { delete pendingConfigSaves.current[pipeName]; });
+                    pendingConfigSaves.current[pipeName] = savePromise;
+                  }}
+                />
+              </div>
+            </section>
+          </div>
+        </div>
+        {connectionModalEl}
       </div>
     );
   }
@@ -2121,14 +2602,20 @@ export function PipesSection() {
                 role="button"
                 tabIndex={0}
                 aria-expanded={expanded === pipe.config.name}
-                onClick={() => toggleExpand(pipe.config.name)}
+                onClick={() =>
+                  onOpenPipe
+                    ? onOpenPipe(pipe.config.name)
+                    : toggleExpand(pipe.config.name)
+                }
                 onKeyDown={(e) => {
                   if (e.key === "Enter" || e.key === " ") {
                     e.preventDefault();
-                    toggleExpand(pipe.config.name);
+                    onOpenPipe
+                      ? onOpenPipe(pipe.config.name)
+                      : toggleExpand(pipe.config.name);
                   }
                 }}
-                title={expanded === pipe.config.name ? "collapse" : "open — runs, config, logs"}
+                title={onOpenPipe ? "open editor — chat, triggers, instructions" : (expanded === pipe.config.name ? "collapse" : "open — runs, config, logs")}
                 className="flex items-center gap-2.5 px-4 pt-3 pb-1 cursor-pointer select-none focus:outline-none focus-visible:ring-1 focus-visible:ring-ring"
               >
                 {/* Disclosure chevron — the row's "you can open this" cue.
@@ -3126,61 +3613,7 @@ export function PipesSection() {
         </form>
       </div>
 
-      {connectionModal && (
-        <PostInstallConnectionsModal
-          open={!!connectionModal}
-          onOpenChange={async (open) => {
-            if (!open) {
-              // Re-check against fresh connection state.
-              // Required IDs can be named instances like "notion:crm", while
-              // availableConnections are keyed by base ID ("notion").
-              let latestConnections = availableConnections;
-              try {
-                latestConnections = await fetchAvailablePipeConnections(
-                  apiBase,
-                  availableConnections
-                );
-              } catch {
-                // Fall back to current in-memory state if fetch fails.
-              }
-
-              // If any required connection is still missing, disable the pipe
-              const stillMissing = connectionModal.connections.some((id) => {
-                const baseId = pipeConnectionLookupKey(id);
-                const conn = latestConnections.find((c) => c.id === baseId);
-                return !conn || !conn.connected;
-              });
-              if (stillMissing) {
-                disablePipe(connectionModal.pipeName);
-              } else {
-                fetchPipes();
-              }
-              fetchConnections();
-              setConnectionModal(null);
-            }
-          }}
-          pipeName={connectionModal.pipeName}
-          connections={connectionModal.connections}
-          onConnectionRemoved={(_connectionId, updatedConnections) => {
-            const pipeName = connectionModal.pipeName;
-            setConnectionModal((prev) =>
-              prev ? { ...prev, connections: updatedConnections } : prev
-            );
-            setPipes((prev) =>
-              prev.map((pipe) =>
-                pipe.config.name === pipeName
-                  ? {
-                      ...pipe,
-                      config: { ...pipe.config, connections: updatedConnections },
-                    }
-                  : pipe
-              )
-            );
-            fetchPipes();
-            fetchConnections();
-          }}
-        />
-      )}
+      {connectionModalEl}
 
       <PublishDialog
         open={!!publishPipeName}

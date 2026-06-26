@@ -13,6 +13,8 @@ import { PipeScheduleBuilder } from "./pipe-schedule-builder";
 import type { ScheduleConfig } from "@/lib/utils/schedule-builder";
 import type { AvailableConnection } from "@/lib/pipe-connections";
 import { Plus, Search, Clock, CalendarClock, Workflow, Loader2, Check } from "lucide-react";
+import { Switch } from "@/components/ui/switch";
+import { cn } from "@/lib/utils";
 
 export interface TriggerSource {
   app: string;
@@ -122,6 +124,65 @@ export function PipeTriggerPicker(props: PickerProps) {
   const remove = (kind: "events" | "custom" | "sources", i: number) =>
     persistTrigger({ ...trigger, [kind]: (trigger?.[kind] ?? []).filter((_, j) => j !== i) });
 
+  // Per-trigger enable/disable (Notion-style switch per row). A disabled
+  // trigger is moved out of the saved config (so the backend stops firing it)
+  // into a per-pipe localStorage stash, and restored when re-enabled — no
+  // backend schema change required.
+  const STORAGE_KEY = `pipe-disabled-triggers:${pipeName}`;
+  const [disabled, setDisabled] = useState<Trigger>({});
+  useEffect(() => {
+    try {
+      setDisabled(JSON.parse(localStorage.getItem(`pipe-disabled-triggers:${pipeName}`) || "{}"));
+    } catch {
+      setDisabled({});
+    }
+  }, [pipeName]);
+  const saveDisabled = (next: Trigger) => {
+    setDisabled(next);
+    try {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(next));
+    } catch {}
+  };
+
+  const disabledEvents = disabled.events ?? [];
+  const disabledCustom = disabled.custom ?? [];
+  const disabledSources = disabled.sources ?? [];
+
+  const toggleEvent = (e: string, enable: boolean) => {
+    if (enable) {
+      saveDisabled({ ...disabled, events: disabledEvents.filter((x) => x !== e) });
+      if (!events.includes(e)) persistTrigger({ ...trigger, events: [...events, e] });
+    } else {
+      saveDisabled({ ...disabled, events: [...disabledEvents, e] });
+      persistTrigger({ ...trigger, events: events.filter((x) => x !== e) });
+    }
+  };
+  const toggleCustom = (c: string, enable: boolean) => {
+    if (enable) {
+      saveDisabled({ ...disabled, custom: disabledCustom.filter((x) => x !== c) });
+      if (!custom.includes(c)) persistTrigger({ ...trigger, custom: [...custom, c] });
+    } else {
+      saveDisabled({ ...disabled, custom: [...disabledCustom, c] });
+      persistTrigger({ ...trigger, custom: custom.filter((x) => x !== c) });
+    }
+  };
+  const toggleSource = (s: TriggerSource, enable: boolean) => {
+    const key = JSON.stringify(s);
+    if (enable) {
+      saveDisabled({ ...disabled, sources: disabledSources.filter((x) => JSON.stringify(x) !== key) });
+      persistTrigger({ ...trigger, sources: [...sources, s] });
+    } else {
+      saveDisabled({ ...disabled, sources: [...disabledSources, s] });
+      persistTrigger({ ...trigger, sources: sources.filter((x) => JSON.stringify(x) !== key) });
+    }
+  };
+  const removeDisabledEvent = (e: string) =>
+    saveDisabled({ ...disabled, events: disabledEvents.filter((x) => x !== e) });
+  const removeDisabledCustom = (c: string) =>
+    saveDisabled({ ...disabled, custom: disabledCustom.filter((x) => x !== c) });
+  const removeDisabledSource = (s: TriggerSource) =>
+    saveDisabled({ ...disabled, sources: disabledSources.filter((x) => JSON.stringify(x) !== JSON.stringify(s)) });
+
   const chip = "text-xs bg-muted/50 border rounded-none px-3 py-1.5 flex-1 font-mono truncate";
   const xBtn = "text-muted-foreground/0 group-hover/item:text-muted-foreground hover:!text-foreground transition-all text-sm leading-none px-1";
 
@@ -135,19 +196,44 @@ export function PipeTriggerPicker(props: PickerProps) {
         {events.map((e, i) => (
           <div key={`e${i}`} className="flex items-center gap-1.5 group/item">
             <span className={chip}>› {eventLabel(e)}</span>
+            <Switch checked onCheckedChange={(c) => toggleEvent(e, c)} aria-label="enable trigger" />
             <button className={xBtn} aria-label="remove" onClick={() => remove("events", i)}>×</button>
           </div>
         ))}
         {sources.map((s, i) => (
           <div key={`s${i}`} className="flex items-center gap-1.5 group/item">
             <span className={chip} title={s.path || s.filter?.channel || ""}>› {sourceLabel(s)}</span>
+            <Switch checked onCheckedChange={(c) => toggleSource(s, c)} aria-label="enable trigger" />
             <button className={xBtn} aria-label="remove" onClick={() => remove("sources", i)}>×</button>
           </div>
         ))}
         {custom.map((c, i) => (
           <div key={`c${i}`} className="flex items-center gap-1.5 group/item">
             <span className={chip}>› {c}</span>
+            <Switch checked onCheckedChange={(v) => toggleCustom(c, v)} aria-label="enable trigger" />
             <button className={xBtn} aria-label="remove" onClick={() => remove("custom", i)}>×</button>
+          </div>
+        ))}
+        {/* Disabled triggers — kept out of the saved config, toggle to restore */}
+        {disabledEvents.map((e, i) => (
+          <div key={`de${i}`} className="flex items-center gap-1.5 group/item">
+            <span className={cn(chip, "opacity-50")}>› {eventLabel(e)}</span>
+            <Switch checked={false} onCheckedChange={(c) => toggleEvent(e, c)} aria-label="enable trigger" />
+            <button className={xBtn} aria-label="remove" onClick={() => removeDisabledEvent(e)}>×</button>
+          </div>
+        ))}
+        {disabledSources.map((s, i) => (
+          <div key={`ds${i}`} className="flex items-center gap-1.5 group/item">
+            <span className={cn(chip, "opacity-50")} title={s.path || s.filter?.channel || ""}>› {sourceLabel(s)}</span>
+            <Switch checked={false} onCheckedChange={(c) => toggleSource(s, c)} aria-label="enable trigger" />
+            <button className={xBtn} aria-label="remove" onClick={() => removeDisabledSource(s)}>×</button>
+          </div>
+        ))}
+        {disabledCustom.map((c, i) => (
+          <div key={`dc${i}`} className="flex items-center gap-1.5 group/item">
+            <span className={cn(chip, "opacity-50")}>› {c}</span>
+            <Switch checked={false} onCheckedChange={(v) => toggleCustom(c, v)} aria-label="enable trigger" />
+            <button className={xBtn} aria-label="remove" onClick={() => removeDisabledCustom(c)}>×</button>
           </div>
         ))}
         <button
